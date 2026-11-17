@@ -1,54 +1,17 @@
 /*
-  GEEN1400 — Scott Nickerson
-  Elecrow CrowPanel 5.0 (800x480), ESP32-S3 on the display board.
+  GEEN1400 student panel
+  Elecrow CrowPanel 5.0 (800x480), ESP32-S3.
 
-  Open this folder in the Arduino IDE, not the Uno sketch next door.
   Board: ESP32S3 Dev Module
   PSRAM: OPI PSRAM
   Flash Size: 4MB
-  Partition Scheme: Huge APP (3MB No OTA/1MB SPIFFS)
-  Library: LovyanGFX (Library Manager)
+  Partition: Huge APP (3MB No OTA/1MB SPIFFS)
+  Library: LovyanGFX
 
-  USB-C on the CrowPanel is the program port. If upload sits on
-  "Connecting...", hold BOOT, tap RST, and release BOOT.
-  USB CDC On Boot must stay Disabled. This panel's touch chip uses
-  GPIO 19 and 20, and USB CDC takes those same pins, so the picture
-  stays up and taps stop working. Change panel settings over Bluetooth.
+  USB CDC On Boot must stay Disabled. Touch uses GPIO 19 and 20.
+  If upload sticks on "Connecting...", hold BOOT, tap RST, release BOOT.
 
-  A student selection is sent by Bluetooth to the teacher device. There
-  is no phone app. The teacher answers Yes or No, and that answer shows
-  along the bottom of this panel. The time sent with each selection
-  comes from this panel's clock.
-
-  Green buttons are something the student can try.
-  Orange buttons ask the teacher. Both are sent, so the teacher knows
-  what the student chose. Opening a list does not send. A typed message
-  sends when the student presses Send. Breathing sends when it is
-  opened, and the count starts when the student presses Begin.
-  Grades K through 2 blow out a candle. Older grades use the box.
-
-  The panel stays covered until the class PIN is entered. That is the
-  same four digits chosen on the teacher device. Five minutes with no
-  touch turns the screen off. The next tap asks for the class PIN
-  before the page comes back. The name saved on the panel is locked
-  with that PIN.
-
-  The gear in the top right opens settings. A teacher can change the
-  name on the startup screen, the brightness, and the type size.
-  The same settings can be changed from the CLEAR website. Plug the
-  panel in by USB-C, or connect by Bluetooth. The website asks for the
-  settings password. That password is not the class PIN.
-  Kindergarten and grades 1-2 show a small picture beside the words.
-  Younger grades use bigger letters. Grade 5 uses smaller type.
-  The three boxes on the first page fill the space under the title.
-
-  How this sketch runs:
-  setup() runs once at power-on. loop() then repeats forever.
-  There is no web page on the panel. Each paint function draws one
-  whole screen. A finger tap is noticed in loop(), and that changes
-  which screen variable is current. The next paint draws that screen.
-  The name, brightness, and grade are written to flash, so they are
-  still there after the panel restarts.
+  Sections: board, colors and choices, saved state, radio, pages, drawing, keyboard, navigation.
 */
 
 #include <BLEDevice.h>
@@ -68,8 +31,7 @@
 #include <Wire.h>          // I2C bus, used by the touch chip and the small expander
 #include <Preferences.h>   // saves a few settings in flash across restarts
 #include <esp_system.h>
-#include <LovyanGFX.hpp>   // draws text, rectangles, and reads the touch panel
-#include <math.h>
+#include <LovyanGFX.hpp>
 #if !defined(CONFIG_IDF_TARGET_ESP32S3)
 #error "This sketch requires an ESP32-S3 board. In Arduino IDE select ESP32S3 Dev Module."
 #endif
@@ -388,25 +350,9 @@ static const int KEY_BACKSPACE = 2;
 static const int KEY_CLEAR = 3;
 static const int KEY_SPACE = 4;
 
-// =============================================================================
-// =============================================================================
-//
-//   EDIT THE STUDENT UI TEXT AND COLORS HERE
-//
-//   This block is the words and colors on the panel:
-//   screen colors, grade-level rows, and every choice the student can tap.
-//   Change the text in quotes to change what a student reads.
-//   ACT_ASK and ACT_TYPE are orange. The teacher is asked to answer.
-//   ACT_TRY, ACT_BREATHE, and ACT_WRITE are green. The teacher is told,
-//   and is not asked to decide. ACT_OPEN only opens the next list.
-//   little is the one word K shows on the button. The teacher still
-//   receives the full label. A typed message is cut to 39 characters,
-//   which is all the teacher note can hold.
-//
-//   How those words are drawn is the next big block, at paintHello().
-//
-// =============================================================================
-// =============================================================================
+// --- Colors and choices ---
+// ACT_ASK and ACT_TYPE ask the teacher. ACT_OPEN only opens the next list.
+// little is the short word on a K button. A typed message stops at 39 characters.
 
 // Colors are 16-bit values, the format this display uses (5 bits red,
 // 6 bits green, 5 bits blue), not ordinary web hex. The names are what
@@ -640,13 +586,7 @@ static const Item mainItems[] = {
 };
 static const int MAIN_COUNT = 4;
 
-// =============================================================================
-// =============================================================================
-//
-//   END OF STUDENT UI TEXT AND COLORS
-//
-// =============================================================================
-// =============================================================================
+// --- Saved state ---
 
 // One on-screen key: what it does, the letter it types, and the
 // rectangle used both to draw it and to test a tap.
@@ -661,7 +601,213 @@ struct KeyHit {
 
 // Values that have to survive from one loop() pass to the next.
 // If they were created inside loop(), they would reset every time.
-static LGFX lcd;
+// The glass is the real panel. lcd is a hidden page. Drawing goes on
+// the hidden page, then one copy is sent to the glass, so the picture
+// does not flash while it is being built.
+static LGFX glass;
+
+class QuietCanvas : public lgfx::LGFX_Sprite {
+ public:
+  explicit QuietCanvas(LGFX *device) : lgfx::LGFX_Sprite(device), hw(device) {}
+
+  bool beginBuffer() {
+    setColorDepth(16);
+    setPsram(true);
+    if (!createSprite(hw->width(), hw->height())) {
+      setPsram(false);
+      if (!createSprite(hw->width(), hw->height())) {
+        direct = true;
+        return false;
+      }
+    }
+    direct = false;
+    return true;
+  }
+
+  void init() { hw->init(); }
+  void setBrightness(uint8_t brightness) { hw->setBrightness(brightness); }
+  void setRotation(uint_fast8_t rotation) { hw->setRotation(rotation); }
+  void setFont(const lgfx::IFont *font) {
+    if (direct) hw->setFont(font);
+    else lgfx::LGFX_Sprite::setFont(font);
+  }
+  void setTextDatum(lgfx::textdatum_t datum) {
+    if (direct) hw->setTextDatum(datum);
+    else lgfx::LGFX_Sprite::setTextDatum(datum);
+  }
+  template <typename T>
+  void setTextColor(const T &ink) {
+    if (direct) hw->setTextColor(ink);
+    else lgfx::LGFX_Sprite::setTextColor(ink);
+  }
+  template <typename T, typename U>
+  void setTextColor(const T &ink, const U &paper) {
+    if (direct) hw->setTextColor(ink, paper);
+    else lgfx::LGFX_Sprite::setTextColor(ink, paper);
+  }
+  int32_t textWidth(const char *text) {
+    return direct ? hw->textWidth(text) : lgfx::LGFX_Sprite::textWidth(text);
+  }
+  int32_t textWidth(const String &text) { return textWidth(text.c_str()); }
+  int32_t fontHeight() {
+    return direct ? hw->fontHeight() : lgfx::LGFX_Sprite::fontHeight();
+  }
+
+  template <typename T>
+  void fillScreen(const T &color) {
+    int w = direct ? hw->width() : lgfx::LGFX_Sprite::width();
+    int h = direct ? hw->height() : lgfx::LGFX_Sprite::height();
+    mark(0, 0, w, h);
+    if (direct) hw->fillScreen(color);
+    else lgfx::LGFX_Sprite::fillScreen(color);
+  }
+  template <typename T>
+  void fillRect(int32_t x, int32_t y, int32_t w, int32_t h, const T &color) {
+    mark(x, y, w, h);
+    if (direct) hw->fillRect(x, y, w, h, color);
+    else lgfx::LGFX_Sprite::fillRect(x, y, w, h, color);
+  }
+  template <typename T>
+  void fillRoundRect(int32_t x, int32_t y, int32_t w, int32_t h, int32_t r, const T &color) {
+    mark(x, y, w, h);
+    if (direct) hw->fillRoundRect(x, y, w, h, r, color);
+    else lgfx::LGFX_Sprite::fillRoundRect(x, y, w, h, r, color);
+  }
+  template <typename T>
+  void fillCircle(int32_t x, int32_t y, int32_t r, const T &color) {
+    mark(x - r, y - r, r * 2 + 1, r * 2 + 1);
+    if (direct) hw->fillCircle(x, y, r, color);
+    else lgfx::LGFX_Sprite::fillCircle(x, y, r, color);
+  }
+  template <typename T>
+  void fillEllipse(int32_t x, int32_t y, int32_t rx, int32_t ry, const T &color) {
+    mark(x - rx, y - ry, rx * 2 + 1, ry * 2 + 1);
+    if (direct) hw->fillEllipse(x, y, rx, ry, color);
+    else lgfx::LGFX_Sprite::fillEllipse(x, y, rx, ry, color);
+  }
+  template <typename T>
+  void fillTriangle(int32_t x0, int32_t y0, int32_t x1, int32_t y1, int32_t x2, int32_t y2, const T &color) {
+    mark(x0 < x1 ? (x0 < x2 ? x0 : x2) : (x1 < x2 ? x1 : x2),
+         y0 < y1 ? (y0 < y2 ? y0 : y2) : (y1 < y2 ? y1 : y2),
+         (x0 > x1 ? (x0 > x2 ? x0 : x2) : (x1 > x2 ? x1 : x2)) - (x0 < x1 ? (x0 < x2 ? x0 : x2) : (x1 < x2 ? x1 : x2)) + 1,
+         (y0 > y1 ? (y0 > y2 ? y0 : y2) : (y1 > y2 ? y1 : y2)) - (y0 < y1 ? (y0 < y2 ? y0 : y2) : (y1 < y2 ? y1 : y2)) + 1);
+    if (direct) hw->fillTriangle(x0, y0, x1, y1, x2, y2, color);
+    else lgfx::LGFX_Sprite::fillTriangle(x0, y0, x1, y1, x2, y2, color);
+  }
+  template <typename T>
+  void drawLine(int32_t x0, int32_t y0, int32_t x1, int32_t y1, const T &color) {
+    mark(x0 < x1 ? x0 : x1, y0 < y1 ? y0 : y1, (x0 > x1 ? x0 - x1 : x1 - x0) + 1, (y0 > y1 ? y0 - y1 : y1 - y0) + 1);
+    if (direct) hw->drawLine(x0, y0, x1, y1, color);
+    else lgfx::LGFX_Sprite::drawLine(x0, y0, x1, y1, color);
+  }
+  template <typename T>
+  void drawRect(int32_t x, int32_t y, int32_t w, int32_t h, const T &color) {
+    mark(x, y, w, h);
+    if (direct) hw->drawRect(x, y, w, h, color);
+    else lgfx::LGFX_Sprite::drawRect(x, y, w, h, color);
+  }
+  template <typename T>
+  void drawRoundRect(int32_t x, int32_t y, int32_t w, int32_t h, int32_t r, const T &color) {
+    mark(x, y, w, h);
+    if (direct) hw->drawRoundRect(x, y, w, h, r, color);
+    else lgfx::LGFX_Sprite::drawRoundRect(x, y, w, h, r, color);
+  }
+  template <typename T>
+  void drawCircle(int32_t x, int32_t y, int32_t r, const T &color) {
+    mark(x - r, y - r, r * 2 + 1, r * 2 + 1);
+    if (direct) hw->drawCircle(x, y, r, color);
+    else lgfx::LGFX_Sprite::drawCircle(x, y, r, color);
+  }
+  template <typename T>
+  void drawPixel(int32_t x, int32_t y, const T &color) {
+    mark(x, y, 1, 1);
+    if (direct) hw->drawPixel(x, y, color);
+    else lgfx::LGFX_Sprite::drawPixel(x, y, color);
+  }
+  size_t drawString(const char *text, int32_t x, int32_t y) {
+    int32_t w = textWidth(text);
+    int32_t h = fontHeight();
+    mark(x - w, y - h, w * 2 + 8, h * 3);
+    if (direct) return hw->drawString(text, x, y);
+    return lgfx::LGFX_Sprite::drawString(text, x, y);
+  }
+  size_t drawString(const String &text, int32_t x, int32_t y) {
+    return drawString(text.c_str(), x, y);
+  }
+  void pushImage(int32_t x, int32_t y, int32_t w, int32_t h, const uint16_t *data) {
+    mark(x, y, w, h);
+    if (direct) hw->pushImage(x, y, w, h, data);
+    else lgfx::LGFX_Sprite::pushImage(x, y, w, h, data);
+  }
+  void readRect(int32_t x, int32_t y, int32_t w, int32_t h, uint16_t *data) {
+    if (direct) hw->readRect(x, y, w, h, data);
+    else lgfx::LGFX_Sprite::readRect(x, y, w, h, data);
+  }
+
+  void present() {
+    if (direct || !dirty || getBuffer() == nullptr) {
+      dirty = false;
+      return;
+    }
+    int viewW = lgfx::LGFX_Sprite::width();
+    int viewH = lgfx::LGFX_Sprite::height();
+    int left = x0 < 0 ? 0 : x0;
+    int top = y0 < 0 ? 0 : y0;
+    int right = x1 > viewW ? viewW : x1;
+    int bottom = y1 > viewH ? viewH : y1;
+    dirty = false;
+    x0 = viewW;
+    y0 = viewH;
+    x1 = 0;
+    y1 = 0;
+    if (right <= left || bottom <= top) {
+      return;
+    }
+    hw->setClipRect(left, top, right - left, bottom - top);
+    pushSprite(hw, 0, 0);
+    hw->waitDMA();
+    hw->clearClipRect();
+  }
+
+ private:
+  LGFX *hw;
+  bool direct = true;
+  bool dirty = false;
+  int x0 = 0;
+  int y0 = 0;
+  int x1 = 0;
+  int y1 = 0;
+
+  void mark(int x, int y, int w, int h) {
+    if (direct) {
+      return;
+    }
+    if (w < 0) {
+      x += w;
+      w = -w;
+    }
+    if (h < 0) {
+      y += h;
+      h = -h;
+    }
+    int right = x + w + 2;
+    int bottom = y + h + 2;
+    if (!dirty) {
+      x0 = x - 1;
+      y0 = y - 1;
+      x1 = right;
+      y1 = bottom;
+      dirty = true;
+      return;
+    }
+    if (x - 1 < x0) x0 = x - 1;
+    if (y - 1 < y0) y0 = y - 1;
+    if (right > x1) x1 = right;
+    if (bottom > y1) y1 = bottom;
+  }
+};
+
+static QuietCanvas lcd(&glass);
 static Preferences prefs;             // handle for the flash settings
 static bool studentDrawingEnabled = true;
 static ClearStudentSettings pendingStudentSettings = {};
@@ -767,40 +913,20 @@ static uint8_t selectedChalkColor = 1;
 static int cursorX = -1;
 static int cursorY = -1;
 static bool cursorVisible = false;
+static uint16_t cursorPatch[40 * 40];
+static int patchX = 0;
+static int patchY = 0;
+static int patchW = 0;
+static int patchH = 0;
+static bool patchSaved = false;
 static bool storageWarningActive = false;
 static unsigned long storageWarningStartedMs = 0;
 static bool storageSavePending = false;
 static bool storageCleanupRunning = false;
-static bool drawingSyncPending = false;
-static bool drawingSyncWaitingForAck = false;
-static bool exitAfterDrawingSync = false;
-static bool newBoardAfterSync = false;
-static uint8_t drawingSyncState = 0;
-static uint16_t drawingSyncChunkIndex = 0;
-static uint32_t drawingSyncBytesSent = 0;
-static uint32_t drawingSyncId = 0;
-static unsigned long drawingSyncStartedMs = 0;
-static File drawingSyncFile;
-static char drawingSyncPath[40] = "";
-static volatile bool drawingResultReady = false;
-static ClearDrawingResult pendingDrawingResult = {};
 static char drawingOcrText[DRAW_OCR_MAX_BYTES + 1] = "";
 static bool drawingOcrVisible = false;
 static uint16_t drawingOcrPage = 0;
 static uint16_t drawingOcrPageCount = 1;
-static uint8_t ocrReceiveBoard = 0;
-static uint32_t ocrReceiveDrawingId = 0;
-static uint16_t ocrReceiveExpectedBytes = 0;
-static uint16_t ocrReceiveBytes = 0;
-static uint16_t ocrReceiveNextChunk = 0;
-static char ocrReceiveText[DRAW_OCR_MAX_BYTES + 1] = "";
-static bool ocrReceiveActive = false;
-static uint32_t ocrReceiveCompletedId = 0;
-static bool ocrReceiveCompletedOk = false;
-static portMUX_TYPE ocrBleMux = portMUX_INITIALIZER_UNLOCKED;
-static volatile bool ocrBlePacketReady = false;
-static uint8_t pendingOcrBleBytes[sizeof(ClearOcrTextChunk)] = {};
-static uint8_t pendingOcrBleLength = 0;
 static char drawStatus[64] = "Draw on the board";
 static unsigned long drawStatusUntilMs = 0;
 
@@ -827,7 +953,6 @@ static const unsigned long RACE_MS = 5UL * 60UL * 1000UL;
 // One five-minute visit for the chalkboard and the notebook together.
 // Switching between them does not start the time over.
 static bool expressRunning = false;
-static bool expressTimeUp = false;
 static bool expressClockPaused = false;
 static unsigned long expressMs = 0;
 static unsigned long expressDrawMs = 0;
@@ -1185,8 +1310,7 @@ static void copyField(char *dest, int size, const char *src) {
   dest[i] = 0;
 }
 
-// The radio task calls this when a packet arrives. It only stores the
-// packet. Drawing and the screen stay in loop(), where they are safe.
+// The radio task only stores a packet. The screen changes in loop().
 static void takeLinkPacket(const uint8_t *data, int len) {
   if (len == (int)sizeof(ClearStudentSettings)) {
     ClearStudentSettings settings;
@@ -1200,33 +1324,6 @@ static void takeLinkPacket(const uint8_t *data, int len) {
     noInterrupts();
     pendingStudentSettings = settings;
     studentSettingsReady = true;
-    interrupts();
-    return;
-  }
-  if (len >= 2 && data[0] == CLEAR_LINK_VERSION &&
-      (data[1] == CLEAR_KIND_OCR_TEXT_START ||
-       data[1] == CLEAR_KIND_OCR_TEXT_CHUNK ||
-       data[1] == CLEAR_KIND_OCR_TEXT_END) &&
-      len <= (int)sizeof(pendingOcrBleBytes)) {
-    portENTER_CRITICAL(&ocrBleMux);
-    if (!ocrBlePacketReady) {
-      memcpy(pendingOcrBleBytes, data, len);
-      pendingOcrBleLength = len;
-      ocrBlePacketReady = true;
-    }
-    portEXIT_CRITICAL(&ocrBleMux);
-    return;
-  }
-  if (len == (int)sizeof(ClearDrawingResult)) {
-    ClearDrawingResult result;
-    memcpy(&result, data, sizeof(result));
-    if (result.version != CLEAR_LINK_VERSION ||
-        result.kind != CLEAR_KIND_DRAWING_RESULT) {
-      return;
-    }
-    noInterrupts();
-    pendingDrawingResult = result;
-    drawingResultReady = true;
     interrupts();
     return;
   }
@@ -1319,7 +1416,6 @@ class TeacherClientCallbacks : public BLEClientCallbacks {
 };
 
 static TeacherClientCallbacks teacherClientCallbacks;
-static void sendDrawingStep();
 
 // The radio calls this when the one-second search ends. It only sets a
 // flag. Connecting here would freeze the touch read.
@@ -1450,10 +1546,8 @@ static bool websiteOnRadio() {
   return false;
 }
 
-// Look for the teacher only when a notice still has to be sent.
-// The search used to freeze this sketch for a second. The touch chip
-// then kept reporting the old finger, and every later tap was ignored.
-// The search now finishes in the background.
+// --- Radio ---
+// Search for the teacher only while a notice is waiting, and finish that search in the background.
 static void blePump() {
   if (!linkReady) {
     return;
@@ -2122,28 +2216,9 @@ static void paintBrand(int y) {
   lcd.drawString("CLEAR Bridge", 56, y);
 }
 
-// =============================================================================
-// =============================================================================
-//
-//   EDIT HOW THE SCREENS ARE DRAWN HERE
-//
-//   Each function below draws one full page:
-//     paintHello()       startup greeting
-//     paintList()        the choice buttons on screen
-//     paintSelected()    the steps for one choice
-//     paintBreathMotion() the counting square
-//     paintWrite()       three lines for how the student feels
-//     paintDrawingMenu() board choices
-//     paintDrawingCanvas() board surface and drawing controls
-//     paintSettings()    name, brightness, and grade level
-//     paintNameEditor()  the keyboard
-//   The words themselves are in the text-and-colors block above.
-//   The age group picked in settings changes the type size.
-//   Back, the gear, and the bottom status strip are drawn by the
-//   smaller functions just above this banner.
-//
-// =============================================================================
-// =============================================================================
+// --- Pages ---
+// paintHello, paintList, paintSelected, paintBreathMotion, paintWrite,
+// paintDrawingMenu, paintDrawingCanvas, paintSettings, paintNameEditor.
 
 // Greeting. A tap anywhere except the gear leaves this screen early.
 // After HELLO_MS with no tap, loop() leaves it on its own.
@@ -2804,6 +2879,7 @@ static void paintNameEditor() {
   paintBattery();
 }
 
+// --- Drawing ---
 static void paintDrawingMenu() {
   lcd.fillScreen(pageBg());
   paintTopButton(DRAW_BACK_X, DRAW_BACK_Y, DRAW_BACK_W, DRAW_BACK_H, "Back", COL_ROW);
@@ -2915,6 +2991,8 @@ static void paintChalkChoices() {
 }
 
 static void paintDrawingCanvas() {
+  patchSaved = false;
+  cursorVisible = false;
   uint16_t surface = drawingSurfaceColor();
   uint16_t header = selectedBoard == BOARD_CHALK ? 0x13A4 : COL_BG;
   lcd.fillScreen(surface);
@@ -3000,7 +3078,7 @@ static void paintDrawingCanvas() {
 
 static uint16_t drawingInkColor() {
   if (selectedBoard == BOARD_GRAPH) {
-     return 0xFFFF;;
+     return 0xFFFF;
   }
   return selectedBoard == BOARD_WHITE ? 0x0000 : DRAW_CHALK_COLORS[selectedChalkColor];
 }
@@ -3033,88 +3111,53 @@ static void drawCursorTool(int x, int y) {
   }
 }
 
-static bool clipDrawingLine(int &x1, int &y1, int &x2, int &y2,
-                            int left, int top, int right, int bottom) {
-  double dx = x2 - x1;
-  double dy = y2 - y1;
-  double t0 = 0.0;
-  double t1 = 1.0;
-  double p[4] = {-dx, dx, -dy, dy};
-  double q[4] = {x1 - left, right - x1, y1 - top, bottom - y1};
-  for (int i = 0; i < 4; i++) {
-    if (p[i] == 0.0) {
-      if (q[i] < 0.0) return false;
-      continue;
-    }
-    double ratio = q[i] / p[i];
-    if (p[i] < 0.0) {
-      if (ratio > t1) return false;
-      if (ratio > t0) t0 = ratio;
-    } else {
-      if (ratio < t0) return false;
-      if (ratio < t1) t1 = ratio;
-    }
+// The pen is drawn on top of the picture. The pixels underneath are
+// saved first and put back when the pen moves, so the board is not
+// wiped and redrawn on every step.
+static void hideDrawingCursor() {
+  if (patchSaved) {
+    lcd.pushImage(patchX, patchY, patchW, patchH, cursorPatch);
   }
-  int originalX = x1;
-  int originalY = y1;
-  x1 = originalX + (int)(t0 * dx);
-  y1 = originalY + (int)(t0 * dy);
-  x2 = originalX + (int)(t1 * dx);
-  y2 = originalY + (int)(t1 * dy);
-  return true;
+  patchSaved = false;
+  cursorVisible = false;
 }
 
-static void restoreCursorArea(int x, int y) {
-  const int left = x - 2;
-  const int top = y - 29;
-  const int right = x + 24;
-  const int bottom = y + 4;
-  const int clippedLeft = left < 0 ? 0 : left;
-  const int clippedTop = top < DRAW_HEADER_H ? DRAW_HEADER_H : top;
-  const int clippedRight = right > 799 ? 799 : right;
-  const int clippedBottom = bottom >= DRAW_CANVAS_BOTTOM ? DRAW_CANVAS_BOTTOM - 1 : bottom;
-  if (clippedLeft > clippedRight || clippedTop > clippedBottom) {
-    return;
+static void showDrawingCursor(int x, int y) {
+  int left = x - 4;
+  int top = y - 32;
+  int wide = 36;
+  int high = 40;
+  if (left < 0) {
+    wide += left;
+    left = 0;
   }
-
-  lcd.fillRect(clippedLeft, clippedTop, clippedRight - clippedLeft + 1,
-               clippedBottom - clippedTop + 1, drawingSurfaceColor());
-  if (selectedBoard == BOARD_GRAPH) {
-    for (int gx = (clippedLeft / 20) * 20; gx <= clippedRight; gx += 20) {
-      lcd.drawLine(gx, clippedTop, gx, clippedBottom, 0xCE79);
-    }
-    int firstGridY = DRAW_HEADER_H +
-                     ((clippedTop - DRAW_HEADER_H) / 20) * 20;
-    for (int gy = firstGridY; gy <= clippedBottom; gy += 20) {
-      lcd.drawLine(clippedLeft, gy, clippedRight, gy, 0xCE79);
-    }
+  if (top < DRAW_HEADER_H) {
+    high -= DRAW_HEADER_H - top;
+    top = DRAW_HEADER_H;
   }
-
-  for (int i = 0; i < drawingSegmentCount; i++) {
-    const DrawingSegment &segment = drawingSegments[i];
-    int firstOffset = -(segment.width / 2);
-    int lastOffset = firstOffset + segment.width - 1;
-    for (int offset = firstOffset; offset <= lastOffset; offset++) {
-      int x1 = segment.x1;
-      int y1 = segment.y1 + offset;
-      int x2 = segment.x2;
-      int y2 = segment.y2 + offset;
-      if (clipDrawingLine(x1, y1, x2, y2, clippedLeft, clippedTop,
-                          clippedRight, clippedBottom)) {
-        lcd.drawLine(x1, y1, x2, y2, segment.color);
-      }
-    }
+  if (left + wide > 800) {
+    wide = 800 - left;
   }
-}
-
-static void moveDrawingCursor(int x, int y) {
-  if (cursorVisible) {
-    restoreCursorArea(cursorX, cursorY);
+  if (top + high > DRAW_CANVAS_BOTTOM) {
+    high = DRAW_CANVAS_BOTTOM - top;
+  }
+  if (wide > 0 && high > 0 && wide * high <= (int)(sizeof(cursorPatch) / sizeof(cursorPatch[0]))) {
+    lcd.readRect(left, top, wide, high, cursorPatch);
+    patchX = left;
+    patchY = top;
+    patchW = wide;
+    patchH = high;
+    patchSaved = true;
   }
   drawCursorTool(x, y);
   cursorX = x;
   cursorY = y;
   cursorVisible = true;
+}
+
+static void moveDrawingCursor(int x, int y) {
+  hideDrawingCursor();
+  showDrawingCursor(x, y);
 }
 
 static void drawInkSegment(int x1, int y1, int x2, int y2) {
@@ -3511,340 +3554,12 @@ static bool deleteOldestLocalDrawing() {
   return true;
 }
 
-static void writeXmlAttribute(File &file, const char *text) {
-  for (const char *p = text; p != nullptr && *p; p++) {
-    if (*p == '&') file.print("&amp;");
-    else if (*p == '"') file.print("&quot;");
-    else if (*p == '<') file.print("&lt;");
-    else if (*p == '>') file.print("&gt;");
-    else file.write((uint8_t)*p);
-  }
-}
-
-static void colorToHex(uint16_t color, char *out, size_t size) {
-  uint8_t red = ((color >> 11) & 0x1F) * 255 / 31;
-  uint8_t green = ((color >> 5) & 0x3F) * 255 / 63;
-  uint8_t blue = (color & 0x1F) * 255 / 31;
-  snprintf(out, size, "#%02X%02X%02X", red, green, blue);
-}
-
-static bool writeDrawingSvg(int board, const char *path) {
-  File file = SPIFFS.open(path, FILE_WRITE);
-  if (!file) return false;
-  file.print("<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"800\" height=\"480\" viewBox=\"0 0 800 480\" data-board=\"");
-  file.print(drawingBoardName(board));
-  file.print("\" data-student=\"");
-  writeXmlAttribute(file, studentName);
-  file.print("\" data-drawing-id=\"");
-  file.print(currentDrawingId);
-  file.print("\"><rect width=\"800\" height=\"480\" fill=\"");
-  char hex[8];
-  colorToHex(board == BOARD_CHALK ? 0x13A4 : 0xFFFF, hex, sizeof(hex));
-  file.print(hex);
-  file.print("\"/>");
-  if (board == BOARD_GRAPH) {
-    file.print("<g stroke=\"#D0D0D0\" stroke-width=\"1\">");
-    for (int x = 0; x < 800; x += 20) {
-      file.printf("<line x1=\"%d\" y1=\"%d\" x2=\"%d\" y2=\"%d\"/>",
-                  x, DRAW_HEADER_H, x, DRAW_CANVAS_BOTTOM - 1);
-    }
-    for (int y = DRAW_HEADER_H; y < DRAW_CANVAS_BOTTOM; y += 20) {
-      file.printf("<line x1=\"0\" y1=\"%d\" x2=\"799\" y2=\"%d\"/>", y, y);
-    }
-    file.print("</g>");
-  }
-  for (int i = 0; i < drawingSegmentCount; i++) {
-    const DrawingSegment &segment = drawingSegments[i];
-    colorToHex(segment.color, hex, sizeof(hex));
-    file.printf("<line x1=\"%u\" y1=\"%u\" x2=\"%u\" y2=\"%u\" stroke=\"%s\" stroke-width=\"%u\" stroke-linecap=\"round\"/>",
-                segment.x1, segment.y1, segment.x2, segment.y2, hex, segment.width);
-  }
-  file.print("</svg>");
-  file.flush();
-  bool ok = file.getWriteError() == 0;
-  file.close();
-  return ok;
-}
-
-static bool prepareDrawingSync(bool startNewBoard) {
-  if (drawingSyncPending || drawingSyncWaitingForAck) {
-    setDrawStatus("A drawing is already being sent");
-    return false;
-  }
-  if (!saveDrawingFile()) return false;
-  if (!writeDrawingSvg(selectedBoard, "/drawing-export.svg")) {
-    SPIFFS.remove("/drawing-export.svg");
-    warnDrawingStorage("Storage issue. Old board will be removed in 2:00");
-    return false;
-  }
-  drawingSyncFile = SPIFFS.open("/drawing-export.svg", FILE_READ);
-  if (!drawingSyncFile) {
-    SPIFFS.remove("/drawing-export.svg");
-    warnDrawingStorage("Storage issue. Old board will be removed in 2:00");
-    return false;
-  }
-  drawingSyncId = currentDrawingId;
-  drawingSyncBytesSent = 0;
-  drawingSyncChunkIndex = 0;
-  drawingSyncState = 0;
-  drawingSyncStartedMs = millis();
-  newBoardAfterSync = startNewBoard;
-  drawingSyncPending = true;
-  setDrawStatus("Waiting to send drawing to teacher");
-  return true;
-}
-
-static bool sendDrawingPacket(const uint8_t *data, size_t size) {
-  return noticeRemote != nullptr &&
-         noticeRemote->writeValue((uint8_t *)data, size, true);
-}
-
-static void sendOcrTextAck(uint32_t drawingId, uint16_t chunkIndex,
-                           bool accepted) {
-  ClearOcrTextAck ack = {};
-  ack.version = CLEAR_LINK_VERSION;
-  ack.kind = CLEAR_KIND_OCR_TEXT_ACK;
-  ack.drawingId = drawingId;
-  ack.chunkIndex = chunkIndex;
-  ack.accepted = accepted ? 1 : 0;
-  if (!sendDrawingPacket((const uint8_t *)&ack, sizeof(ack))) {
-    Serial.println("OCR text acknowledgement could not be sent");
-  }
-}
-
-static void processOcrTextPacket(const uint8_t *data, size_t length) {
-  if (length < 2 || data[0] != CLEAR_LINK_VERSION) return;
-  if (data[1] == CLEAR_KIND_OCR_TEXT_START &&
-      length == sizeof(ClearOcrTextStart)) {
-    ClearOcrTextStart start = {};
-    memcpy(&start, data, sizeof(start));
-    bool accepted = start.board <= BOARD_CHALK &&
-                    start.totalBytes > 0 &&
-                    start.totalBytes <= DRAW_OCR_MAX_BYTES;
-    ocrReceiveActive = accepted;
-    ocrReceiveBoard = start.board;
-    ocrReceiveDrawingId = start.drawingId;
-    ocrReceiveExpectedBytes = accepted ? start.totalBytes : 0;
-    ocrReceiveBytes = 0;
-    ocrReceiveNextChunk = 0;
-    ocrReceiveText[0] = 0;
-    sendOcrTextAck(start.drawingId, 0xFFFF, accepted);
-    return;
-  }
-
-  if (data[1] == CLEAR_KIND_OCR_TEXT_CHUNK &&
-      length >= offsetof(ClearOcrTextChunk, payload)) {
-    ClearOcrTextChunk chunk = {};
-    size_t headerSize = offsetof(ClearOcrTextChunk, payload);
-    memcpy(&chunk, data, length < sizeof(chunk) ? length : sizeof(chunk));
-    bool shapeValid = chunk.payloadSize > 0 &&
-                      chunk.payloadSize <= CLEAR_DRAWING_CHUNK_SIZE &&
-                      length == headerSize + chunk.payloadSize;
-    bool accepted = ocrReceiveActive && shapeValid &&
-                    chunk.drawingId == ocrReceiveDrawingId;
-    if (accepted && chunk.chunkIndex < ocrReceiveNextChunk) {
-      size_t offset = (size_t)chunk.chunkIndex * CLEAR_DRAWING_CHUNK_SIZE;
-      accepted = offset + chunk.payloadSize <= ocrReceiveBytes &&
-                 memcmp(ocrReceiveText + offset, chunk.payload,
-                        chunk.payloadSize) == 0;
-    } else if (accepted && chunk.chunkIndex == ocrReceiveNextChunk) {
-      accepted = (size_t)ocrReceiveBytes + chunk.payloadSize <=
-                 ocrReceiveExpectedBytes;
-      if (accepted) {
-        memcpy(ocrReceiveText + ocrReceiveBytes, chunk.payload,
-               chunk.payloadSize);
-        ocrReceiveBytes += chunk.payloadSize;
-        ocrReceiveNextChunk++;
-      }
-    } else if (accepted) {
-      accepted = false;
-    }
-    sendOcrTextAck(chunk.drawingId, chunk.chunkIndex, accepted);
-    return;
-  }
-
-  if (data[1] == CLEAR_KIND_OCR_TEXT_END &&
-      length == sizeof(ClearOcrTextEnd)) {
-    ClearOcrTextEnd end = {};
-    memcpy(&end, data, sizeof(end));
-    bool accepted = ocrReceiveActive &&
-                    end.drawingId == ocrReceiveDrawingId &&
-                    end.chunkCount == ocrReceiveNextChunk &&
-                    ocrReceiveBytes == ocrReceiveExpectedBytes;
-    if (accepted) {
-      ocrReceiveText[ocrReceiveBytes] = 0;
-      for (uint16_t i = 0; i < ocrReceiveBytes; i++) {
-        if (ocrReceiveText[i] == 0) accepted = false;
-      }
-    }
-    if (accepted) {
-      accepted = saveDrawingOcr(ocrReceiveBoard, ocrReceiveDrawingId,
-                                ocrReceiveText, ocrReceiveBytes);
-    }
-    ocrReceiveActive = false;
-    if (accepted && selectedBoard == ocrReceiveBoard &&
-        currentDrawingId == ocrReceiveDrawingId) {
-      memcpy(drawingOcrText, ocrReceiveText, ocrReceiveBytes + 1);
-      drawingOcrVisible = false;
-      drawingOcrPage = 0;
-      drawingOcrPageCount = 1;
-      if (currentScreen == SCREEN_DRAW_CANVAS) {
-        setDrawStatus("Readable text received. Tap Read to view it");
-      }
-    }
-    if (!accepted) {
-      Serial.println("OCR text was rejected or could not be saved");
-    }
-    sendOcrTextAck(end.drawingId, 0xFFFE, accepted);
-  }
-}
-
-static void serviceOcrTextPacket() {
-  uint8_t packet[sizeof(ClearOcrTextChunk)] = {};
-  uint8_t length = 0;
-  portENTER_CRITICAL(&ocrBleMux);
-  if (ocrBlePacketReady) {
-    length = pendingOcrBleLength;
-    memcpy(packet, pendingOcrBleBytes, length);
-    ocrBlePacketReady = false;
-    pendingOcrBleLength = 0;
-  }
-  portEXIT_CRITICAL(&ocrBleMux);
-  if (length) processOcrTextPacket(packet, length);
-}
-
-static void sendDrawingStep() {
-  if (noticeRemote == nullptr || drawingSyncWaitingForAck) return;
-  if (drawingSyncState == 0) {
-    ClearDrawingStart packet = {};
-    packet.version = CLEAR_LINK_VERSION;
-    packet.kind = CLEAR_KIND_DRAWING_START;
-    packet.drawingId = drawingSyncId;
-    packet.board = selectedBoard;
-    packet.totalBytes = drawingSyncFile.size();
-    copyField(packet.student, sizeof(packet.student), studentName);
-    if (!sendDrawingPacket((const uint8_t *)&packet, sizeof(packet))) {
-      drawingSyncPending = false;
-      drawingSyncFile.close();
-      setDrawStatus("Could not start transfer; tap Save to retry");
-      return;
-    }
-    drawingSyncState = 1;
-    setDrawStatus("Sending drawing to teacher");
-    return;
-  }
-  if (drawingSyncState == 1 && drawingSyncFile.available()) {
-    ClearDrawingChunk packet = {};
-    packet.version = CLEAR_LINK_VERSION;
-    packet.kind = CLEAR_KIND_DRAWING_CHUNK;
-    packet.drawingId = drawingSyncId;
-    packet.chunkIndex = drawingSyncChunkIndex;
-    size_t count = drawingSyncFile.read(packet.payload, CLEAR_DRAWING_CHUNK_SIZE);
-    if (count == 0) {
-      drawingSyncPending = false;
-      drawingSyncFile.close();
-      setDrawStatus("Drawing transfer stopped; tap Save to retry");
-      return;
-    }
-    packet.payloadSize = count;
-    size_t packetSize = offsetof(ClearDrawingChunk, payload) + count;
-    if (!sendDrawingPacket((const uint8_t *)&packet, packetSize)) {
-      drawingSyncPending = false;
-      drawingSyncFile.close();
-      setDrawStatus("Drawing transfer failed; tap Save to retry");
-      return;
-    }
-    drawingSyncBytesSent += count;
-    drawingSyncChunkIndex++;
-    return;
-  }
-  if (drawingSyncState == 1) {
-    if (drawingSyncBytesSent != drawingSyncFile.size()) {
-      drawingSyncPending = false;
-      drawingSyncFile.close();
-      setDrawStatus("Drawing export was incomplete; tap Save to retry");
-      return;
-    }
-    ClearDrawingEnd packet = {};
-    packet.version = CLEAR_LINK_VERSION;
-    packet.kind = CLEAR_KIND_DRAWING_END;
-    packet.drawingId = drawingSyncId;
-    if (!sendDrawingPacket((const uint8_t *)&packet, sizeof(packet))) {
-      drawingSyncPending = false;
-      drawingSyncFile.close();
-      setDrawStatus("Drawing transfer failed; tap Save to retry");
-      return;
-    }
-    drawingSyncPending = false;
-    drawingSyncWaitingForAck = true;
-    drawingSyncStartedMs = millis();
-    setDrawStatus("Waiting for teacher card confirmation");
-  }
-}
-
-static void finishDrawingSync(bool saved) {
-  drawingSyncWaitingForAck = false;
-  drawingSyncPending = false;
-  drawingSyncState = 0;
-  if (drawingSyncFile) drawingSyncFile.close();
-  if (!saved) {
-    newBoardAfterSync = false;
-    if (expressTimeUp) {
-      expressTimeUp = false;
-      exitAfterDrawingSync = false;
-      expressRunning = false;
-      fromExpress = false;
-      bridgerSay("Five minutes. Time for a break.");
-      currentScreen = SCREEN_ZONE;
-      paintZone();
-      return;
-    }
-    exitAfterDrawingSync = false;
-    setDrawStatus("Teacher card could not save; tap Save to retry");
-    return;
-  }
-  setDrawStatus("Drawing saved to teacher card");
-  if (newBoardAfterSync) {
-    newBoardAfterSync = false;
-    clearDrawingOcr(selectedBoard);
-    drawingSegmentCount = 0;
-    currentDrawingId = newDrawingId();
-    cursorVisible = false;
-    saveDrawingFile();
-    paintDrawingCanvas();
-    setDrawStatus("New board ready");
-  }
-  if (expressTimeUp) {
-    expressTimeUp = false;
-    exitAfterDrawingSync = false;
-    expressRunning = false;
-    fromExpress = false;
-    bridgerSay("Five minutes. Time for a break.");
-    currentScreen = SCREEN_ZONE;
-    paintZone();
-    return;
-  }
-  if (exitAfterDrawingSync) {
-    exitAfterDrawingSync = false;
-    if (fromExpress) {
-      fromExpress = false;
-      currentScreen = SCREEN_EXPRESS;
-      paintExpress();
-    } else {
-      openDrawingMenu();
-    }
-  }
-}
-
 static void finishDrawingStroke() {
   if (!drawingStroke) return;
   drawingStroke = false;
   lastDrawX = -1;
   lastDrawY = -1;
-  if (cursorVisible) {
-    restoreCursorArea(cursorX, cursorY);
-    cursorVisible = false;
-  }
+  hideDrawingCursor();
   saveDrawingFile();
 }
 
@@ -3883,13 +3598,7 @@ static void updateDrawingStorageWarning() {
   }
 }
 
-// =============================================================================
-// =============================================================================
-//
-//   END OF SCREEN DRAWING
-//
-// =============================================================================
-// =============================================================================
+// --- Keyboard and navigation ---
 
 // Capitalize the first letter, and the letter after a space, hyphen,
 // or apostrophe, so "mary ann" becomes "Mary Ann" and "o'brien" becomes "O'Brien".
@@ -5245,7 +4954,6 @@ static void startExpressTimer() {
     return;
   }
   expressRunning = true;
-  expressTimeUp = false;
   expressClockPaused = false;
   expressMs = millis();
   expressDrawMs = expressMs;
@@ -5253,7 +4961,6 @@ static void startExpressTimer() {
 
 static void stopExpressTimer() {
   expressRunning = false;
-  expressTimeUp = false;
   expressClockPaused = false;
 }
 
@@ -5265,15 +4972,7 @@ static void endExpressTime() {
     trimName(messageEdit);
     copyField(writeLines[writeSlot], WRITE_MAX + 1, messageEdit);
   }
-  if (currentScreen == SCREEN_DRAW_CANVAS &&
-      (drawingSyncPending || drawingSyncWaitingForAck)) {
-    expressTimeUp = true;
-    exitAfterDrawingSync = true;
-    setDrawStatus("Time is up. Finishing the save.");
-    return;
-  }
   expressRunning = false;
-  expressTimeUp = false;
   fromExpress = false;
   bridgerSay("Five minutes. Time for a break.");
   currentScreen = SCREEN_ZONE;
@@ -5980,27 +5679,22 @@ static void wakePanel() {
   paintLock();
 }
 
-// Runs once. Order matters: the expander and the saved settings are
-// ready before the panel starts, and the backlight level is applied
-// after init() because init() is what attaches PWM to pin 2.
+// --- Startup ---
 void setup() {
-  // Light the backlight immediately so the panel is not black during
-  // the rest of startup. applyBrightness() replaces this with PWM.
   pinMode(PIN_BL, OUTPUT);
   digitalWrite(PIN_BL, HIGH);
 
   initExpander();
   loadSettings();          // name, brightness, grade, and class PIN
   startClock();
-  // Drawings live in the SPIFFS area of flash. Mount it before the
-  // screen starts, so a first-time prepare does not fight the picture.
-  // A later start leaves saved drawings alone.
+  // Mount drawings before the screen starts. The first start prepares storage.
   drawStorageReady = SPIFFS.begin(false);
   if (!drawStorageReady) {
     drawStorageReady = SPIFFS.begin(true);
   }
   lcd.init();              // start the panel with the wiring stored above
   lcd.setRotation(0);      // 0 matches the touch map. Another value would move taps off the buttons.
+  lcd.beginBuffer();       // draw on a hidden page so screen changes do not flash
   // The panel start also uses these two pins. Take them back for the
   // touch chip, at the slower speed that this glass answers on.
   Wire.begin(19, 20);
@@ -6025,6 +5719,7 @@ void setup() {
   }
   lockNote[sizeof(lockNote) - 1] = 0;
   paintLock();
+  lcd.present();
   Serial.begin(115200);
   startPanelRadio();
 }
@@ -6437,8 +6132,8 @@ static void servicePanelCommands() {
 // Repeats forever. A finger is read on every pass. The teacher search
 // runs in the background so it does not hold the touch chip.
 void loop() {
+  lcd.present();
   servicePanelCommands();
-  serviceOcrTextPacket();
 
   if (millis() - clockMs >= 60000) {
     clockMs = millis();
@@ -6533,20 +6228,6 @@ void loop() {
     }
   }
 
-  if (drawingResultReady) {
-    ClearDrawingResult result;
-    noInterrupts();
-    result = pendingDrawingResult;
-    drawingResultReady = false;
-    interrupts();
-    if (drawingSyncWaitingForAck && result.drawingId == drawingSyncId) {
-      finishDrawingSync(result.saved != 0);
-    }
-  }
-  if (drawingSyncWaitingForAck &&
-      (millis() - drawingSyncStartedMs) >= 15000) {
-    finishDrawingSync(false);
-  }
   if (storageWarningActive || currentScreen == SCREEN_DRAW_CANVAS) {
     updateDrawingStorageWarning();
   }
@@ -6602,9 +6283,9 @@ void loop() {
         expressDrawMs = millis();
         expressClockPaused = false;
       }
-      if (!expressTimeUp && (millis() - expressMs) >= EXPRESS_MS) {
+      if ((millis() - expressMs) >= EXPRESS_MS) {
         endExpressTime();
-      } else if (!expressTimeUp && (millis() - expressDrawMs) >= 1000) {
+      } else if ((millis() - expressDrawMs) >= 1000) {
         expressDrawMs = millis();
         paintExpressClock();
       }
@@ -6627,7 +6308,7 @@ void loop() {
     wakePanel();
     woke = true;
   }
-  if (!woke && currentScreen == SCREEN_DRAW_CANVAS && !drawingOcrVisible && !expressTimeUp) {
+  if (!woke && currentScreen == SCREEN_DRAW_CANVAS && !drawingOcrVisible) {
     if (!touchDown) {
       finishDrawingStroke();
     } else if (!drawingStroke && !touchWasDown &&
@@ -6641,12 +6322,14 @@ void loop() {
       drawingStroke = true;
       lastDrawX = tx;
       lastDrawY = drawY;
+      hideDrawingCursor();
       drawInkSegment(tx, drawY, tx, drawY);
-      moveDrawingCursor(tx, drawY);
+      showDrawingCursor(tx, drawY);
     } else if (drawingStroke && ty >= DRAW_HEADER_H &&
                ty < DRAW_CANVAS_BOTTOM) {
+      hideDrawingCursor();
       drawInkSegment(lastDrawX, lastDrawY, tx, ty);
-      moveDrawingCursor(tx, ty);
+      showDrawingCursor(tx, ty);
       lastDrawX = tx;
       lastDrawY = ty;
     } else if (drawingStroke) {
@@ -7014,7 +6697,7 @@ void loop() {
       } else if (inBox(tx, ty, 24, 298, 752, 96)) {
         openDrawingCanvas(BOARD_CHALK);
       }
-    } else if (currentScreen == SCREEN_DRAW_CANVAS && !expressTimeUp) {
+    } else if (currentScreen == SCREEN_DRAW_CANVAS) {
       if (inBox(tx, ty, DRAW_BACK_X, DRAW_BACK_Y, DRAW_BACK_W, DRAW_BACK_H)) {
         finishDrawingStroke();
         if (drawingSegmentCount > 0) {
@@ -7195,4 +6878,5 @@ void loop() {
   if (!touchDown) {
     blePump();
   }
+  lcd.present();
 }

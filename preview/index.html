@@ -473,6 +473,7 @@ function paintBattery(ctx) {
   }
   text(ctx, pct + "%", x + w + 12, y + h / 2, 14, ink, "left", "middle");
 }
+// --- Student pages ---
 function paintHello() {
   sc.fillStyle = S.BG;
   sc.fillRect(0, 0, 800, 480);
@@ -901,6 +902,7 @@ function penColor() {
   if (ui.board === 1) return "#000";
   return CHALK[ui.chalk].fill;
 }
+// --- Drawing board ---
 function paintDraw() {
   const chalk = ui.board === 2;
   const surface = chalk ? rgb(0x13A4) : "#000";
@@ -1468,6 +1470,7 @@ function paintTeacherLook() {
   text(tc, "Dark", 176, 198, 16, C.FG, "center");
   dimTeacher();
 }
+// --- Teacher pages ---
 function paintTeacher() {
   if (ui.teacherStep === "look") {
     paintTeacherLook();
@@ -1981,6 +1984,7 @@ function localPoint(canvas, event) {
     (event.clientY - rect.top) * canvas.height / rect.height
   ];
 }
+// --- Pointer ---
 student.addEventListener("click", (event) => {
   if (ui.screen === "draw") return;
   const [x, y] = localPoint(student, event);

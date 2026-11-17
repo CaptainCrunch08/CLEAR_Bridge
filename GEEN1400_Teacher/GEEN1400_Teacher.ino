@@ -1,57 +1,20 @@
 /*
   GEEN1400 teacher device
-  ESP32-2432S024 ("CYD"): ESP32-WROOM-32, 2.4 inch ILI9341 240x320.
-  The picture uses SPI. The touch chip is capacitive and uses I2C,
-  address 0x15 (CST816 family). Yes, No, and Next are buttons drawn
-  on the glass.
+  ESP32-2432S024 ("CYD"): ESP32-WROOM-32, ILI9341 240x320.
+  Picture: SPI. Touch: I2C address 0x15. Board: ESP32 Dev Module.
+  Partition: Default 4MB with spiffs. Library: LovyanGFX.
 
-  Board in the Arduino IDE: ESP32 Dev Module
-  Partition: Default 4MB with spiffs
-  Library: LovyanGFX (Library Manager)
+  The week stays in flash. The website reads it over USB after the
+  class PIN and teacher code are accepted. See CLEAR_WebLink.h.
+  Drawings stay on the student panel.
 
-  This board does not show the week as a USB drive. The week stays
-  in the chip's flash. The CLEAR website reads that week over this
-  same USB port after the class PIN and teacher code are accepted.
-  See CLEAR_WebLink.h.
-
-  The touch controller's origin is the opposite corner of the picture.
-  A tap is flipped on both axes so the finger and the button match.
-
-  Blank button  GPIO22 to GND. Press to black the glass. Press again
-  to bring the picture back. Power stays on. The pin holds itself
-  high until the button is pressed.
-  The gear in the top right opens Look. Brightness and light or dark
-  are saved there. Full power on this backlight is harsh, so the bright
-  end of the slider stays below full power.
-  Buzzer        GPIO21   active or passive buzzer to GND.
-  One second: a student choice. Two short: an accommodation.
-  Two short then a longer one: Help, or I need my teacher.
-  Yes or Not yet after a strategy is saved in the week and does not buzz.
-
-  A student panel sends the name, the issue, and the request or solution
-  over Bluetooth. This screen opens on the oldest one. Next moves to the
-  following student. Yes and No answer the student on screen and send
-  that answer back.
-
-  Drawings stay on the student panel. This device does not keep them
-  and does not send them to the website.
-
-  The week is kept in the chip's flash. This board does not show that
-  flash as a USB drive. A panel that has not been allowed yet is held on a waiting
-  list. Its message is not shown and is not written into the week.
-
-  Neither ESP32 has a battery clock. The student panel keeps the time,
-  starting from the moment its sketch was uploaded, and sends that time
-  with every selection. This board adopts that time while it stays on,
-  and a Yes or No stores when the reply happened. The website turns
-  those times into the computer's local time and into how long the
-  reply took. Time spent while a board is unplugged is not counted.
+  Blank button: GPIO22 to GND. Buzzer: GPIO21 to GND.
+  Sections: board, queue screen, week file, radio, touch.
 */
 
 #include <SPIFFS.h>
 #include "CLEAR_WebLink.h"
 #include <WiFi.h>
-#include <HTTPClient.h>
 #include <Preferences.h>
 #include <BLEDevice.h>
 #include <BLEServer.h>
@@ -59,12 +22,10 @@
 #include <BLESecurity.h>
 #include <BLE2902.h>
 #include <LovyanGFX.hpp>
-#include <math.h>
 #include <string.h>
 #include <time.h>
 #include <sys/time.h>
 #include <esp_sntp.h>
-#include <esp_heap_caps.h>
 #include "CLEAR_Link.h"
 #include "CLEAR_Seal.h"
 #if __has_include("CLEAR_Teacher_Config.h")
@@ -76,20 +37,6 @@
 #endif
 #ifndef CLEAR_WIFI_PASSWORD
 #define CLEAR_WIFI_PASSWORD ""
-#endif
-#ifndef CLEAR_OCR_SERVER_URL
-#define CLEAR_OCR_SERVER_URL ""
-#endif
-#ifndef CLEAR_OCR_TOKEN
-#define CLEAR_OCR_TOKEN ""
-#endif
-
-#if defined(CONFIG_IDF_TARGET_ESP32S3) && (!defined(ARDUINO_USB_MODE) || ARDUINO_USB_MODE != 1)
-#include "USB.h"
-#include "USBMSC.h"
-#define CLEAR_USB_DRIVE 1
-#else
-#define CLEAR_USB_DRIVE 0
 #endif
 #include <Wire.h>
 
@@ -152,32 +99,7 @@ static const char *LOG_HEADER =
 
 static const int LIST_MAX = 12;
 static const int RING_MAX = 8;
-static const int DRAWING_RING_MAX = 16;
 static const unsigned long BUTTON_GAP_MS = 200;
-static const uint32_t DISK_SECTORS = 8192;
-static const uint32_t DISK_BYTES = DISK_SECTORS * 512;
-static const uint16_t DISK_FAT_SECTORS = 6;
-static const uint16_t DISK_ROOT_ENTRIES = 128;
-static const uint16_t DISK_ROOT_SECTORS = DISK_ROOT_ENTRIES / 16;
-static const uint16_t DISK_SECTORS_PER_CLUSTER = 4;
-static const uint16_t DISK_DATA_START_SECTOR =
-  1 + DISK_FAT_SECTORS + DISK_ROOT_SECTORS;
-static const uint16_t DISK_CLUSTER_BYTES = DISK_SECTORS_PER_CLUSTER * 512;
-static const uint16_t DISK_MAX_FILES = DISK_ROOT_ENTRIES;
-static const size_t DRAWING_MAX_BYTES = 300000;
-static const uint8_t OCR_QUEUE_MAX = 4;
-
-struct DrawingPacketEntry {
-  uint8_t bytes[sizeof(ClearDrawingChunk)];
-  uint8_t length;
-};
-
-struct DiskFileEntry {
-  char path[48];
-  char shortName[11];
-  uint32_t size;
-  uint16_t firstCluster;
-};
 
 // US Mountain time, so the small screen matches a Colorado classroom.
 // The file itself stores UTC. The website uses the computer's time zone.
@@ -235,65 +157,175 @@ public:
   }
 };
 
-static LGFX lcd;
+// The glass is the real panel. lcd is a hidden page. The picture is
+// finished there, then copied once, so a new screen does not flash.
+static LGFX glass;
+
+class QuietCanvas : public lgfx::LGFX_Sprite {
+ public:
+  explicit QuietCanvas(LGFX *device) : lgfx::LGFX_Sprite(device), hw(device) {}
+
+  bool beginBuffer() {
+    setColorDepth(16);
+    setPsram(true);
+    if (!createSprite(hw->width(), hw->height())) {
+      setPsram(false);
+      if (!createSprite(hw->width(), hw->height())) {
+        direct = true;
+        return false;
+      }
+    }
+    direct = false;
+    return true;
+  }
+
+  void init() { hw->init(); }
+  void setBrightness(uint8_t brightness) { hw->setBrightness(brightness); }
+  void setRotation(uint_fast8_t rotation) { hw->setRotation(rotation); }
+  void setFont(const lgfx::IFont *font) {
+    if (direct) hw->setFont(font);
+    else lgfx::LGFX_Sprite::setFont(font);
+  }
+  void setTextDatum(lgfx::textdatum_t datum) {
+    if (direct) hw->setTextDatum(datum);
+    else lgfx::LGFX_Sprite::setTextDatum(datum);
+  }
+  template <typename T>
+  void setTextColor(const T &ink) {
+    if (direct) hw->setTextColor(ink);
+    else lgfx::LGFX_Sprite::setTextColor(ink);
+  }
+  template <typename T, typename U>
+  void setTextColor(const T &ink, const U &paper) {
+    if (direct) hw->setTextColor(ink, paper);
+    else lgfx::LGFX_Sprite::setTextColor(ink, paper);
+  }
+  int32_t textWidth(const char *text) {
+    return direct ? hw->textWidth(text) : lgfx::LGFX_Sprite::textWidth(text);
+  }
+  int32_t textWidth(const String &text) { return textWidth(text.c_str()); }
+  int32_t fontHeight() {
+    return direct ? hw->fontHeight() : lgfx::LGFX_Sprite::fontHeight();
+  }
+
+  template <typename T>
+  void fillScreen(const T &color) {
+    int w = direct ? hw->width() : lgfx::LGFX_Sprite::width();
+    int h = direct ? hw->height() : lgfx::LGFX_Sprite::height();
+    mark(0, 0, w, h);
+    if (direct) hw->fillScreen(color);
+    else lgfx::LGFX_Sprite::fillScreen(color);
+  }
+  template <typename T>
+  void fillRect(int32_t x, int32_t y, int32_t w, int32_t h, const T &color) {
+    mark(x, y, w, h);
+    if (direct) hw->fillRect(x, y, w, h, color);
+    else lgfx::LGFX_Sprite::fillRect(x, y, w, h, color);
+  }
+  template <typename T>
+  void fillRoundRect(int32_t x, int32_t y, int32_t w, int32_t h, int32_t r, const T &color) {
+    mark(x, y, w, h);
+    if (direct) hw->fillRoundRect(x, y, w, h, r, color);
+    else lgfx::LGFX_Sprite::fillRoundRect(x, y, w, h, r, color);
+  }
+  template <typename T>
+  void fillCircle(int32_t x, int32_t y, int32_t r, const T &color) {
+    mark(x - r, y - r, r * 2 + 1, r * 2 + 1);
+    if (direct) hw->fillCircle(x, y, r, color);
+    else lgfx::LGFX_Sprite::fillCircle(x, y, r, color);
+  }
+  template <typename T>
+  void drawRect(int32_t x, int32_t y, int32_t w, int32_t h, const T &color) {
+    mark(x, y, w, h);
+    if (direct) hw->drawRect(x, y, w, h, color);
+    else lgfx::LGFX_Sprite::drawRect(x, y, w, h, color);
+  }
+  size_t drawString(const char *text, int32_t x, int32_t y) {
+    int32_t w = textWidth(text);
+    int32_t h = fontHeight();
+    mark(x - w, y - h, w * 2 + 8, h * 3);
+    if (direct) return hw->drawString(text, x, y);
+    return lgfx::LGFX_Sprite::drawString(text, x, y);
+  }
+  size_t drawString(const String &text, int32_t x, int32_t y) {
+    return drawString(text.c_str(), x, y);
+  }
+
+  void present() {
+    if (direct || !dirty || getBuffer() == nullptr) {
+      dirty = false;
+      return;
+    }
+    int viewW = lgfx::LGFX_Sprite::width();
+    int viewH = lgfx::LGFX_Sprite::height();
+    int left = x0 < 0 ? 0 : x0;
+    int top = y0 < 0 ? 0 : y0;
+    int right = x1 > viewW ? viewW : x1;
+    int bottom = y1 > viewH ? viewH : y1;
+    dirty = false;
+    x0 = viewW;
+    y0 = viewH;
+    x1 = 0;
+    y1 = 0;
+    if (right <= left || bottom <= top) {
+      return;
+    }
+    hw->setClipRect(left, top, right - left, bottom - top);
+    pushSprite(hw, 0, 0);
+    hw->waitDMA();
+    hw->clearClipRect();
+  }
+
+ private:
+  LGFX *hw;
+  bool direct = true;
+  bool dirty = false;
+  int x0 = 0;
+  int y0 = 0;
+  int x1 = 0;
+  int y1 = 0;
+
+  void mark(int x, int y, int w, int h) {
+    if (direct) {
+      return;
+    }
+    if (w < 0) {
+      x += w;
+      w = -w;
+    }
+    if (h < 0) {
+      y += h;
+      h = -h;
+    }
+    int right = x + w + 2;
+    int bottom = y + h + 2;
+    if (!dirty) {
+      x0 = x - 1;
+      y0 = y - 1;
+      x1 = right;
+      y1 = bottom;
+      dirty = true;
+      return;
+    }
+    if (x - 1 < x0) x0 = x - 1;
+    if (y - 1 < y0) y0 = y - 1;
+    if (right > x1) x1 = right;
+    if (bottom > y1) y1 = bottom;
+  }
+};
+
+static QuietCanvas lcd(&glass);
 static bool storageOk = false;
-static bool usbMounted = false;
 static int viewIndex = 0;
 static int waitingCount = 0;
 static ClearNote waiting[LIST_MAX];
 static ClearNote noticeRing[RING_MAX];
 static volatile uint8_t ringWrite = 0;
 static uint8_t ringRead = 0;
-static DrawingPacketEntry drawingRing[DRAWING_RING_MAX];
-static volatile uint8_t drawingRingWrite = 0;
-static uint8_t drawingRingRead = 0;
-static volatile bool drawingQueueOverflow = false;
-static volatile uint32_t drawingOverflowId = 0;
-static uint32_t activeDrawingId = 0;
-static uint32_t activeDrawingBytes = 0;
-static uint32_t activeDrawingReceived = 0;
-static uint16_t activeDrawingChunkIndex = 0;
-static uint8_t activeDrawingBoard = 0;
-static File activeDrawingFile;
-static char activeDrawingTempPath[40] = "";
-static char activeDrawingPath[40] = "";
-struct OcrJob {
-  char path[40];
-  char remoteJobId[40];
-  uint32_t drawingId;
-  uint8_t board;
-  bool serverJobStarted;
-  bool textReady;
-  uint16_t textSize;
-  unsigned long remoteJobStartedMs;
-  unsigned long nextRemotePollMs;
-  char text[601];
-};
-enum OcrProcessResult {
-  OCR_PROCESS_READY,
-  OCR_PROCESS_WAITING,
-  OCR_PROCESS_RETRY,
-  OCR_PROCESS_FAILED
-};
-
-static OcrJob ocrJobs[OCR_QUEUE_MAX] = {};
-static uint8_t ocrJobWrite = 0;
-static uint8_t ocrJobRead = 0;
-static bool ocrJobOverflow = false;
-static portMUX_TYPE ocrAckMux = portMUX_INITIALIZER_UNLOCKED;
-static volatile bool ocrAckReady = false;
-static volatile uint32_t ocrAckDrawingId = 0;
-static volatile uint16_t ocrAckChunkIndex = 0;
-static volatile bool ocrAckAccepted = false;
-static unsigned long nextOcrWifiRetryMs = 0;
-static unsigned long nextOcrAttemptMs = 0;
-static bool ocrConfigWarningShown = false;
-static DiskFileEntry diskFiles[DISK_MAX_FILES];
-static uint16_t diskFileCount = 0;
+static unsigned long nextWifiRetryMs = 0;
 static unsigned long buttonMs = 0;
 static bool touchWasDown = false;
 static BLECharacteristic *replyChar = nullptr;
-static uint8_t *disk = nullptr;
 static Preferences privacyPrefs;
 static int screenMode = MODE_ENTER_PIN;
 static int lookReturn = MODE_ENTER_PIN;
@@ -322,10 +354,6 @@ static ClearNote pendingNotes[PENDING_MAX];
 static int pendingCount = 0;
 static int pendingView = 0;
 static String weekPlain;
-
-#if CLEAR_USB_DRIVE
-static USBMSC MSC;
-#endif
 
 static void copyField(char *dest, int size, const char *src) {
   int i = 0;
@@ -540,7 +568,6 @@ class ClearSecurityCallbacks : public BLESecurityCallbacks {
 
 static void paintTapButton(int x, const char *label, uint16_t fill);
 static void finishSignIn();
-static void applyLook();
 static void paintGear();
 static void paintStudentSettings();
 
@@ -564,6 +591,7 @@ static void paintPrivacyKeys() {
   }
 }
 
+// --- Queue screen ---
 static void paintPrivacy() {
   lcd.fillScreen(COL_BG);
   lcd.setTextDatum(textdatum_t::top_left);
@@ -1164,8 +1192,6 @@ static void paintScreen() {
   paintGear();
 }
 
-static bool refreshDisk();
-
 static bool saveWeekPlain() {
   if (!fourDigits(classPin)) {
     File file = SPIFFS.open(LOG_PATH, FILE_WRITE);
@@ -1186,9 +1212,6 @@ static bool saveWeekPlain() {
   }
   file.print(sealed);
   file.close();
-  if (disk != nullptr) {
-    refreshDisk();
-  }
   return true;
 }
 
@@ -1241,8 +1264,8 @@ static bool writeFreshLog() {
   return saveWeekPlain();
 }
 
-// No battery clock. A saved time covers a reboot. Wi-Fi, when the OCR
-// network is up, moves the clock forward by the hours the power was off.
+// --- Week file and clock ---
+// A saved time covers a reboot. Wi-Fi, when a network name is set, sets the clock.
 static bool ntpStarted = false;
 static bool clockSynced = false;
 static unsigned long clockSaveMs = 0;
@@ -1278,9 +1301,9 @@ static void serviceNetworkClock() {
     return;
   }
   if (WiFi.status() != WL_CONNECTED) {
-    if ((long)(millis() - nextOcrWifiRetryMs) >= 0) {
+    if ((long)(millis() - nextWifiRetryMs) >= 0) {
       WiFi.begin(CLEAR_WIFI_SSID, CLEAR_WIFI_PASSWORD);
-      nextOcrWifiRetryMs = millis() + 30000;
+      nextWifiRetryMs = millis() + 30000;
     }
     return;
   }
@@ -1440,259 +1463,6 @@ static void startStorage() {
   }
 }
 
-static void fat12Set(uint8_t *fat, int cluster, uint16_t value) {
-  int offset = cluster + (cluster / 2);
-  if (cluster & 1) {
-    fat[offset] = (fat[offset] & 0x0F) | ((value << 4) & 0xF0);
-    fat[offset + 1] = (value >> 4) & 0xFF;
-  } else {
-    fat[offset] = value & 0xFF;
-    fat[offset + 1] = (fat[offset + 1] & 0xF0) | ((value >> 8) & 0x0F);
-  }
-}
-
-static bool addDiskFile(const char *path, const char shortName[11],
-                        uint8_t *fat, uint8_t *root,
-                        uint16_t *nextCluster) {
-  if (diskFileCount >= DISK_MAX_FILES) {
-    return false;
-  }
-  File file = SPIFFS.open(path, FILE_READ);
-  if (!file) {
-    return false;
-  }
-  uint32_t size = file.size();
-  uint16_t clusters = (size + DISK_CLUSTER_BYTES - 1) / DISK_CLUSTER_BYTES;
-  if (clusters == 0) {
-    clusters = 1;
-  }
-  uint16_t maxCluster = (DISK_SECTORS - DISK_DATA_START_SECTOR) /
-                        DISK_SECTORS_PER_CLUSTER + 1;
-  if ((uint32_t)*nextCluster + clusters - 1 > maxCluster) {
-    file.close();
-    return false;
-  }
-
-  uint16_t firstCluster = *nextCluster;
-  uint32_t remaining = size;
-  for (uint16_t i = 0; i < clusters; i++) {
-    uint16_t cluster = firstCluster + i;
-    uint16_t next = (i + 1 == clusters) ? 0xFFF : cluster + 1;
-    fat12Set(fat, cluster, next);
-    uint32_t offset = (DISK_DATA_START_SECTOR +
-                       (uint32_t)(cluster - 2) * DISK_SECTORS_PER_CLUSTER) * 512;
-    uint32_t count = remaining < DISK_CLUSTER_BYTES
-                       ? remaining : DISK_CLUSTER_BYTES;
-    if (count > 0 && file.read(disk + offset, count) != count) {
-      file.close();
-      return false;
-    }
-    remaining -= count;
-  }
-  file.close();
-
-  DiskFileEntry &entry = diskFiles[diskFileCount];
-  copyField(entry.path, sizeof(entry.path), path);
-  memcpy(entry.shortName, shortName, sizeof(entry.shortName));
-  entry.size = size;
-  entry.firstCluster = firstCluster;
-  *nextCluster += clusters;
-
-  uint8_t *directoryEntry = root + diskFileCount * 32;
-  memcpy(directoryEntry, shortName, 11);
-  directoryEntry[11] = 0x20;
-  directoryEntry[26] = firstCluster & 0xFF;
-  directoryEntry[27] = (firstCluster >> 8) & 0xFF;
-  directoryEntry[28] = size & 0xFF;
-  directoryEntry[29] = (size >> 8) & 0xFF;
-  directoryEntry[30] = (size >> 16) & 0xFF;
-  directoryEntry[31] = (size >> 24) & 0xFF;
-  diskFileCount++;
-  return true;
-}
-
-static bool isDrawingSvg(const char *path) {
-  if (path == nullptr || strncmp(path, "/draw-", 6) != 0) {
-    return false;
-  }
-  size_t length = strlen(path);
-  return length > 4 && strcmp(path + length - 4, ".svg") == 0;
-}
-
-static bool refreshDisk() {
-  if (disk == nullptr || !storageOk) {
-    return false;
-  }
-  memset(disk, 0, DISK_BYTES);
-  diskFileCount = 0;
-  uint8_t *boot = disk;
-  boot[0] = 0xEB;
-  boot[1] = 0x3C;
-  boot[2] = 0x90;
-  memcpy(boot + 3, "MSDOS5.0", 8);
-  boot[11] = 0x00;
-  boot[12] = 0x02;
-  boot[13] = DISK_SECTORS_PER_CLUSTER;
-  boot[14] = 1;
-  boot[16] = 1;
-  boot[17] = DISK_ROOT_ENTRIES & 0xFF;
-  boot[18] = (DISK_ROOT_ENTRIES >> 8) & 0xFF;
-  boot[19] = DISK_SECTORS & 0xFF;
-  boot[20] = (DISK_SECTORS >> 8) & 0xFF;
-  boot[21] = 0xF8;
-  boot[22] = DISK_FAT_SECTORS;
-  boot[24] = 1;
-  boot[26] = 1;
-  boot[38] = 0x29;
-  boot[39] = 0x34;
-  boot[40] = 0x12;
-  memcpy(boot + 43, "CLEAR WEEK ", 11);
-  memcpy(boot + 54, "FAT12   ", 8);
-  boot[510] = 0x55;
-  boot[511] = 0xAA;
-
-  uint8_t *fat = disk + 512;
-  uint8_t *dir = disk + (1 + DISK_FAT_SECTORS) * 512;
-  fat12Set(fat, 0, 0xFF8);
-  fat12Set(fat, 1, 0xFFF);
-  uint16_t nextCluster = 2;
-  static const char logName[11] = {
-    'C', 'L', 'E', 'A', 'R', ' ', ' ', ' ', 'C', 'S', 'V'
-  };
-  if (!addDiskFile(LOG_PATH, logName, fat, dir, &nextCluster)) {
-    return false;
-  }
-
-  File root = SPIFFS.open("/");
-  if (!root) {
-    return false;
-  }
-  uint16_t drawingNumber = 1;
-  while (File file = root.openNextFile()) {
-    const char *path = file.name();
-    bool drawing = isDrawingSvg(path);
-    char drawingPath[48];
-    copyField(drawingPath, sizeof(drawingPath), path);
-    file.close();
-    if (!drawing) {
-      continue;
-    }
-    char shortName[11];
-    memset(shortName, ' ', sizeof(shortName));
-    char baseName[9];
-    snprintf(baseName, sizeof(baseName), "DRAW%04u", drawingNumber++);
-    memcpy(shortName, baseName, 8);
-    memcpy(shortName + 8, "SVG", 3);
-    if (!addDiskFile(drawingPath, shortName, fat, dir, &nextCluster)) {
-      root.close();
-      return false;
-    }
-  }
-  root.close();
-  return true;
-}
-
-static bool diskHasLog() {
-  if (disk == nullptr) {
-    return false;
-  }
-  uint8_t *dir = disk + (1 + DISK_FAT_SECTORS) * 512;
-  for (int i = 0; i < DISK_ROOT_ENTRIES; i++) {
-    uint8_t *entry = dir + i * 32;
-    if (entry[0] == 0x00) {
-      break;
-    }
-    if (entry[0] == 0xE5) {
-      continue;
-    }
-    if (memcmp(entry, "CLEAR   ", 8) == 0 && memcmp(entry + 8, "CSV", 3) == 0) {
-      uint32_t size = (uint32_t)entry[28] | ((uint32_t)entry[29] << 8) |
-                      ((uint32_t)entry[30] << 16) | ((uint32_t)entry[31] << 24);
-      return size > 0;
-    }
-  }
-  return false;
-}
-
-static void clearWeekFromComputer() {
-  writeFreshLog();
-  waitingCount = 0;
-  viewIndex = 0;
-  refreshDisk();
-  paintScreen();
-}
-
-#if CLEAR_USB_DRIVE
-static int32_t onRead(uint32_t lba, uint32_t offset, void *buffer, uint32_t bufsize) {
-  if (disk == nullptr || lba >= DISK_SECTORS) {
-    return 0;
-  }
-  memcpy(buffer, disk + (lba * 512) + offset, bufsize);
-  return bufsize;
-}
-
-static int32_t onWrite(uint32_t lba, uint32_t offset, uint8_t *buffer, uint32_t bufsize) {
-  if (disk == nullptr || lba >= DISK_SECTORS) {
-    return 0;
-  }
-  memcpy(disk + (lba * 512) + offset, buffer, bufsize);
-  return bufsize;
-}
-
-static bool onStartStop(uint8_t power, bool start, bool eject) {
-  (void)power;
-  (void)eject;
-  if (!start) {
-    usbMounted = false;
-    if (!diskHasLog()) {
-      clearWeekFromComputer();
-    }
-  }
-  return true;
-}
-
-static void usbEvent(void *arg, esp_event_base_t base, int32_t id, void *data) {
-  (void)arg;
-  (void)data;
-  if (base != ARDUINO_USB_EVENTS) {
-    return;
-  }
-  if (id == ARDUINO_USB_STARTED_EVENT) {
-    refreshDisk();
-    usbMounted = true;
-  } else if (id == ARDUINO_USB_STOPPED_EVENT) {
-    usbMounted = false;
-    if (!diskHasLog()) {
-      clearWeekFromComputer();
-    }
-  }
-}
-
-static void startUsbDrive() {
-  disk = (uint8_t *)heap_caps_malloc(DISK_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-  if (disk == nullptr) {
-    disk = (uint8_t *)malloc(DISK_BYTES);
-  }
-  if (disk == nullptr) {
-    return;
-  }
-  refreshDisk();
-  USB.onEvent(usbEvent);
-  MSC.vendorID("CLEAR");
-  MSC.productID("CLEAR week");
-  MSC.productRevision("1.0");
-  MSC.onStartStop(onStartStop);
-  MSC.onRead(onRead);
-  MSC.onWrite(onWrite);
-  MSC.mediaPresent(true);
-  MSC.isWritable(true);
-  MSC.begin(DISK_SECTORS, 512);
-  USB.begin();
-}
-#else
-static void startUsbDrive() {}
-#endif
-
 static void remember(const ClearNote *note) {
   for (int i = 0; i < waitingCount; i++) {
     if (waiting[i].eventId == note->eventId &&
@@ -1715,35 +1485,6 @@ static void remember(const ClearNote *note) {
 }
 
 static void takeNotice(const uint8_t *data, int len) {
-  if (len == (int)sizeof(ClearOcrTextAck)) {
-    ClearOcrTextAck ack;
-    memcpy(&ack, data, sizeof(ack));
-    if (ack.version != CLEAR_LINK_VERSION ||
-        ack.kind != CLEAR_KIND_OCR_TEXT_ACK || ack.accepted > 1) {
-      return;
-    }
-    portENTER_CRITICAL(&ocrAckMux);
-    ocrAckDrawingId = ack.drawingId;
-    ocrAckChunkIndex = ack.chunkIndex;
-    ocrAckAccepted = ack.accepted != 0;
-    ocrAckReady = true;
-    portEXIT_CRITICAL(&ocrAckMux);
-    return;
-  }
-  if (len >= 2 && data[0] == CLEAR_LINK_VERSION &&
-      data[1] >= CLEAR_KIND_DRAWING_START &&
-      data[1] <= CLEAR_KIND_DRAWING_END &&
-      len <= (int)sizeof(ClearDrawingChunk)) {
-    // Drawings stay on the student panel. Tell that panel the picture
-    // was not stored here, and do not write it to flash.
-    if (data[1] == CLEAR_KIND_DRAWING_END &&
-        len >= (int)sizeof(ClearDrawingEnd)) {
-      ClearDrawingEnd endPacket;
-      memcpy(&endPacket, data, sizeof(endPacket));
-      sendDrawingResult(endPacket.drawingId, false);
-    }
-    return;
-  }
   if (len != (int)sizeof(ClearNote)) {
     return;
   }
@@ -1766,8 +1507,6 @@ static void takeNotice(const uint8_t *data, int len) {
 class NoticeCallbacks : public BLECharacteristicCallbacks {
   void onWrite(BLECharacteristic *characteristic) override {
     size_t length = characteristic->getValue().length();
-    // A student note is larger than a drawing chunk. Dropping anything
-    // over the chunk size throws away every Help and Ask message.
     if (length > sizeof(ClearNote)) {
       return;
     }
@@ -1777,6 +1516,7 @@ class NoticeCallbacks : public BLECharacteristicCallbacks {
 
 static NoticeCallbacks noticeCallbacks;
 
+// --- Radio ---
 static void startRadio() {
   BLEDevice::init(CLEAR_BLE_NAME);
   BLEDevice::setMTU(CLEAR_BLE_MTU);
@@ -1840,472 +1580,6 @@ static void serviceStudentSettings() {
   lastSettingsBroadcastMs = millis();
 }
 
-static void sendDrawingResult(uint32_t drawingId, bool saved) {
-  if (replyChar == nullptr) {
-    return;
-  }
-  ClearDrawingResult result = {};
-  result.version = CLEAR_LINK_VERSION;
-  result.kind = CLEAR_KIND_DRAWING_RESULT;
-  result.drawingId = drawingId;
-  result.saved = saved ? 1 : 0;
-  replyChar->setValue((uint8_t *)&result, sizeof(result));
-  replyChar->notify();
-}
-
-static void closeActiveDrawing(bool removePartial) {
-  if (activeDrawingFile) {
-    activeDrawingFile.close();
-  }
-  if (removePartial && activeDrawingTempPath[0]) {
-    SPIFFS.remove(activeDrawingTempPath);
-  }
-  activeDrawingId = 0;
-  activeDrawingBytes = 0;
-  activeDrawingReceived = 0;
-  activeDrawingChunkIndex = 0;
-  activeDrawingTempPath[0] = 0;
-  activeDrawingPath[0] = 0;
-}
-
-// Keep a limited set of drawing files. Older pictures are removed so
-// student work does not fill this device.
-static void pruneOldDrawings(const char *keepPath) {
-  for (int guard = 0; guard < 8; guard++) {
-    int count = 0;
-    char oldestPath[48];
-    oldestPath[0] = 0;
-    time_t oldest = 0;
-    bool haveOldest = false;
-    File root = SPIFFS.open("/");
-    if (!root) {
-      return;
-    }
-    while (File file = root.openNextFile()) {
-      const char *name = file.name();
-      char path[48];
-      if (name != nullptr && name[0] == '/') {
-        copyField(path, sizeof(path), name);
-      } else {
-        snprintf(path, sizeof(path), "/%s", name == nullptr ? "" : name);
-      }
-      bool drawing = isDrawingSvg(path);
-      time_t written = file.getLastWrite();
-      file.close();
-      if (!drawing) {
-        continue;
-      }
-      count++;
-      if (keepPath != nullptr && strcmp(path, keepPath) == 0) {
-        continue;
-      }
-      if (!haveOldest || written < oldest) {
-        haveOldest = true;
-        oldest = written;
-        copyField(oldestPath, sizeof(oldestPath), path);
-      }
-    }
-    root.close();
-    size_t freeBytes = SPIFFS.totalBytes() > SPIFFS.usedBytes()
-                         ? SPIFFS.totalBytes() - SPIFFS.usedBytes() : 0;
-    if (count <= 16 && freeBytes > 80000) {
-      return;
-    }
-    if (!haveOldest) {
-      return;
-    }
-    SPIFFS.remove(oldestPath);
-  }
-}
-
-static void beginDrawingTransfer(const ClearDrawingStart *packet) {
-  closeActiveDrawing(true);
-  if (!storageOk || packet->board > 2 || packet->totalBytes == 0 ||
-      packet->totalBytes > DRAWING_MAX_BYTES) {
-    sendDrawingResult(packet->drawingId, false);
-    return;
-  }
-  snprintf(activeDrawingPath, sizeof(activeDrawingPath),
-           "/draw-%08lX.svg", (unsigned long)packet->drawingId);
-  snprintf(activeDrawingTempPath, sizeof(activeDrawingTempPath),
-           "/draw-%08lX.part", (unsigned long)packet->drawingId);
-  SPIFFS.remove(activeDrawingTempPath);
-  activeDrawingFile = SPIFFS.open(activeDrawingTempPath, FILE_WRITE);
-  if (!activeDrawingFile) {
-    closeActiveDrawing(false);
-    sendDrawingResult(packet->drawingId, false);
-    return;
-  }
-  activeDrawingId = packet->drawingId;
-  activeDrawingBoard = packet->board;
-  activeDrawingBytes = packet->totalBytes;
-  activeDrawingReceived = 0;
-  activeDrawingChunkIndex = 0;
-}
-
-static void handleDrawingPacket(const uint8_t *data, uint8_t length) {
-  if (length < 2 || data[0] != CLEAR_LINK_VERSION) {
-    return;
-  }
-  if (data[1] == CLEAR_KIND_DRAWING_START &&
-      length == sizeof(ClearDrawingStart)) {
-    ClearDrawingStart packet;
-    memcpy(&packet, data, sizeof(packet));
-    beginDrawingTransfer(&packet);
-    return;
-  }
-  if (data[1] == CLEAR_KIND_DRAWING_CHUNK &&
-      length >= offsetof(ClearDrawingChunk, payload)) {
-    ClearDrawingChunk packet = {};
-    memcpy(&packet, data, length);
-    if (activeDrawingId != packet.drawingId ||
-        packet.chunkIndex != activeDrawingChunkIndex ||
-        packet.payloadSize > CLEAR_DRAWING_CHUNK_SIZE ||
-        length != offsetof(ClearDrawingChunk, payload) + packet.payloadSize ||
-        activeDrawingReceived + packet.payloadSize > activeDrawingBytes) {
-      closeActiveDrawing(true);
-      sendDrawingResult(packet.drawingId, false);
-      return;
-    }
-    size_t written = activeDrawingFile.write(packet.payload, packet.payloadSize);
-    if (written != packet.payloadSize) {
-      uint32_t failedId = activeDrawingId;
-      closeActiveDrawing(true);
-      sendDrawingResult(failedId, false);
-      return;
-    }
-    activeDrawingReceived += written;
-    activeDrawingChunkIndex++;
-    return;
-  }
-  if (data[1] == CLEAR_KIND_DRAWING_END &&
-      length == sizeof(ClearDrawingEnd)) {
-    ClearDrawingEnd packet;
-    memcpy(&packet, data, sizeof(packet));
-    bool complete = activeDrawingId == packet.drawingId &&
-                    activeDrawingReceived == activeDrawingBytes;
-    uint32_t finishedId = packet.drawingId;
-    uint8_t finishedBoard = activeDrawingBoard;
-    char finishedPath[sizeof(activeDrawingPath)];
-    copyField(finishedPath, sizeof(finishedPath), activeDrawingPath);
-    if (activeDrawingFile) {
-      activeDrawingFile.flush();
-      activeDrawingFile.close();
-    }
-    char backupPath[40];
-    snprintf(backupPath, sizeof(backupPath),
-             "/draw-%08lX.bak", (unsigned long)finishedId);
-    bool hadPrevious = complete && SPIFFS.exists(activeDrawingPath);
-    if (hadPrevious) {
-      SPIFFS.remove(backupPath);
-      complete = SPIFFS.rename(activeDrawingPath, backupPath);
-    }
-    if (complete) {
-      complete = SPIFFS.rename(activeDrawingTempPath, activeDrawingPath);
-    }
-    if (!complete) {
-      SPIFFS.remove(activeDrawingTempPath);
-      if (hadPrevious) {
-        SPIFFS.rename(backupPath, activeDrawingPath);
-      }
-    } else if (hadPrevious) {
-      SPIFFS.remove(backupPath);
-    }
-    closeActiveDrawing(false);
-    sendDrawingResult(finishedId, complete);
-    if (complete) {
-      pruneOldDrawings(finishedPath);
-      uint8_t next = (ocrJobWrite + 1) % OCR_QUEUE_MAX;
-      if (next == ocrJobRead) {
-        ocrJobOverflow = true;
-      } else {
-        OcrJob &job = ocrJobs[ocrJobWrite];
-        memset(&job, 0, sizeof(job));
-        copyField(job.path, sizeof(job.path), finishedPath);
-        job.drawingId = finishedId;
-        job.board = finishedBoard;
-        ocrJobWrite = next;
-      }
-    }
-  }
-}
-
-static bool clearOcrConfigured() {
-  return CLEAR_WIFI_SSID[0] != 0 && CLEAR_OCR_SERVER_URL[0] != 0 &&
-         CLEAR_OCR_TOKEN[0] != 0;
-}
-
-static void startOcrWifi() {
-  if (!clearOcrConfigured()) {
-    Serial.println("Local OCR is disabled. Configure CLEAR_Teacher_Config.h.");
-    return;
-  }
-  WiFi.mode(WIFI_STA);
-  WiFi.setSleep(false);
-  WiFi.setAutoReconnect(true);
-  WiFi.begin(CLEAR_WIFI_SSID, CLEAR_WIFI_PASSWORD);
-  nextOcrWifiRetryMs = millis() + 30000;
-  Serial.println("Connecting teacher to the local OCR Wi-Fi network.");
-}
-
-static bool sendOcrPacketAndWait(const uint8_t *data, size_t length,
-                                 uint32_t drawingId, uint16_t chunkIndex) {
-  if (replyChar == nullptr) return false;
-  for (int attempt = 0; attempt < 3; attempt++) {
-    portENTER_CRITICAL(&ocrAckMux);
-    ocrAckReady = false;
-    portEXIT_CRITICAL(&ocrAckMux);
-    replyChar->setValue((uint8_t *)data, length);
-    replyChar->notify();
-    unsigned long started = millis();
-    while ((unsigned long)(millis() - started) < 1800) {
-      bool ready;
-      uint32_t ackId;
-      uint16_t ackIndex;
-      bool accepted;
-      portENTER_CRITICAL(&ocrAckMux);
-      ready = ocrAckReady;
-      ackId = ocrAckDrawingId;
-      ackIndex = ocrAckChunkIndex;
-      accepted = ocrAckAccepted;
-      if (ready) ocrAckReady = false;
-      portEXIT_CRITICAL(&ocrAckMux);
-      if (ready && ackId == drawingId && ackIndex == chunkIndex) {
-        return accepted;
-      }
-      delay(2);
-    }
-  }
-  return false;
-}
-
-static bool sendOcrResultToPanel(OcrJob &job) {
-  if (job.textSize == 0 || job.textSize > 600) return false;
-  ClearOcrTextStart start = {};
-  start.version = CLEAR_LINK_VERSION;
-  start.kind = CLEAR_KIND_OCR_TEXT_START;
-  start.drawingId = job.drawingId;
-  start.board = job.board;
-  start.totalBytes = job.textSize;
-  if (!sendOcrPacketAndWait((const uint8_t *)&start, sizeof(start),
-                            job.drawingId, 0xFFFF)) return false;
-
-  uint16_t chunkCount = 0;
-  size_t offset = 0;
-  while (offset < job.textSize) {
-    ClearOcrTextChunk chunk = {};
-    chunk.version = CLEAR_LINK_VERSION;
-    chunk.kind = CLEAR_KIND_OCR_TEXT_CHUNK;
-    chunk.drawingId = job.drawingId;
-    chunk.chunkIndex = chunkCount;
-    size_t count = job.textSize - offset;
-    if (count > CLEAR_DRAWING_CHUNK_SIZE) count = CLEAR_DRAWING_CHUNK_SIZE;
-    chunk.payloadSize = count;
-    memcpy(chunk.payload, job.text + offset, count);
-    size_t packetSize = offsetof(ClearOcrTextChunk, payload) + count;
-    if (!sendOcrPacketAndWait((const uint8_t *)&chunk, packetSize,
-                              job.drawingId, chunkCount)) return false;
-    offset += count;
-    chunkCount++;
-  }
-
-  ClearOcrTextEnd end = {};
-  end.version = CLEAR_LINK_VERSION;
-  end.kind = CLEAR_KIND_OCR_TEXT_END;
-  end.drawingId = job.drawingId;
-  end.chunkCount = chunkCount;
-  return sendOcrPacketAndWait((const uint8_t *)&end, sizeof(end),
-                              job.drawingId, 0xFFFE);
-}
-
-static OcrProcessResult recognizeDrawingLocally(OcrJob &job) {
-  if (!job.serverJobStarted) {
-    File svg = SPIFFS.open(job.path, FILE_READ);
-    if (!svg || svg.size() == 0 || svg.size() > DRAWING_MAX_BYTES) {
-      if (svg) svg.close();
-      Serial.printf("Local OCR: drawing %08lX is missing or too large.\n",
-                    (unsigned long)job.drawingId);
-      return OCR_PROCESS_FAILED;
-    }
-
-    WiFiClient client;
-    HTTPClient http;
-    http.setTimeout(8000);
-    if (!http.begin(client, CLEAR_OCR_SERVER_URL "/recognize")) {
-      svg.close();
-      Serial.println("Local OCR server URL is invalid.");
-      return OCR_PROCESS_RETRY;
-    }
-    http.addHeader("Content-Type", "image/svg+xml");
-    http.addHeader("X-CLEAR-Token", CLEAR_OCR_TOKEN);
-    Serial.printf("Submitting drawing %08lX to local OCR.\n",
-                  (unsigned long)job.drawingId);
-    int responseCode = http.sendRequest("POST", &svg, svg.size());
-    svg.close();
-    if (responseCode != HTTP_CODE_ACCEPTED) {
-      http.end();
-      Serial.printf("Local OCR submission failed (HTTP %d).\n", responseCode);
-      return OCR_PROCESS_RETRY;
-    }
-
-    String jobId = http.getString();
-    http.end();
-    jobId.trim();
-    if (jobId.length() == 0 || jobId.length() >= sizeof(job.remoteJobId)) {
-      Serial.println("Local OCR server returned an invalid job ID.");
-      return OCR_PROCESS_RETRY;
-    }
-    copyField(job.remoteJobId, sizeof(job.remoteJobId), jobId.c_str());
-    job.serverJobStarted = true;
-    job.remoteJobStartedMs = millis();
-    job.nextRemotePollMs = millis() + 1000;
-    return OCR_PROCESS_WAITING;
-  }
-
-  if ((long)(millis() - job.nextRemotePollMs) < 0) {
-    return OCR_PROCESS_WAITING;
-  }
-  if ((unsigned long)(millis() - job.remoteJobStartedMs) >= 300000) {
-    job.serverJobStarted = false;
-    job.remoteJobId[0] = 0;
-    Serial.printf("Local OCR timed out for drawing %08lX.\n",
-                  (unsigned long)job.drawingId);
-    return OCR_PROCESS_RETRY;
-  }
-
-  WiFiClient client;
-  HTTPClient http;
-  http.setTimeout(8000);
-  String resultUrl = String(CLEAR_OCR_SERVER_URL) + "/result/" +
-                     job.remoteJobId;
-  if (!http.begin(client, resultUrl)) {
-    Serial.println("Local OCR result URL is invalid.");
-    job.nextRemotePollMs = millis() + 5000;
-    return OCR_PROCESS_WAITING;
-  }
-  http.addHeader("X-CLEAR-Token", CLEAR_OCR_TOKEN);
-  int responseCode = http.GET();
-  if (responseCode == 202) {
-    http.end();
-    job.nextRemotePollMs = millis() + 1000;
-    return OCR_PROCESS_WAITING;
-  }
-  if (responseCode == HTTP_CODE_OK) {
-    String text = http.getString();
-    http.end();
-    WiFiClient cleanupClient;
-    HTTPClient cleanup;
-    if (cleanup.begin(cleanupClient, resultUrl)) {
-      cleanup.addHeader("X-CLEAR-Token", CLEAR_OCR_TOKEN);
-      cleanup.sendRequest("DELETE");
-      cleanup.end();
-    }
-    if (text.length() == 0 || text.length() > 600) {
-      Serial.println("Local OCR returned no text or text exceeded 600 bytes.");
-      return OCR_PROCESS_FAILED;
-    }
-    for (size_t i = 0; i < text.length(); i++) {
-      if (text[i] == 0 || (uint8_t)text[i] < 0x09 ||
-          ((uint8_t)text[i] > 0x0D && (uint8_t)text[i] < 0x20)) {
-        Serial.println("Local OCR returned unsupported control characters.");
-        return OCR_PROCESS_FAILED;
-      }
-    }
-    memcpy(job.text, text.c_str(), text.length());
-    job.text[text.length()] = 0;
-    job.textSize = text.length();
-    job.textReady = true;
-    job.serverJobStarted = false;
-    job.remoteJobId[0] = 0;
-    return OCR_PROCESS_READY;
-  }
-  http.end();
-  if (responseCode == 404 || responseCode == 422) {
-    Serial.printf("Local OCR could not recognize drawing %08lX (HTTP %d).\n",
-                  (unsigned long)job.drawingId, responseCode);
-    job.serverJobStarted = false;
-    job.remoteJobId[0] = 0;
-    return OCR_PROCESS_FAILED;
-  }
-  Serial.printf("Could not check local OCR job (HTTP %d).\n", responseCode);
-  job.nextRemotePollMs = millis() + 5000;
-  return OCR_PROCESS_WAITING;
-}
-
-static void serviceOcrJobs() {
-  if (ocrJobOverflow) {
-    ocrJobOverflow = false;
-    Serial.println("Local OCR queue is full; a saved drawing was not queued.");
-  }
-  if (ocrJobRead == ocrJobWrite) return;
-  if (!clearOcrConfigured()) {
-    if (!ocrConfigWarningShown) {
-      Serial.println("Drawings are saved, but local OCR is not configured.");
-      ocrConfigWarningShown = true;
-    }
-    return;
-  }
-  ocrConfigWarningShown = false;
-  if (WiFi.status() != WL_CONNECTED) {
-    if ((long)(millis() - nextOcrWifiRetryMs) >= 0) {
-      WiFi.disconnect(false, false);
-      WiFi.begin(CLEAR_WIFI_SSID, CLEAR_WIFI_PASSWORD);
-      nextOcrWifiRetryMs = millis() + 30000;
-      Serial.println("Waiting for the local OCR Wi-Fi connection.");
-    }
-    return;
-  }
-  serviceNetworkClock();
-  if ((long)(millis() - nextOcrAttemptMs) < 0) return;
-
-  OcrJob &job = ocrJobs[ocrJobRead];
-  if (!job.textReady) {
-    OcrProcessResult result = recognizeDrawingLocally(job);
-    if (result == OCR_PROCESS_WAITING) return;
-    if (result == OCR_PROCESS_RETRY) {
-      nextOcrAttemptMs = millis() + 15000;
-      return;
-    }
-    if (result == OCR_PROCESS_FAILED) {
-      // The drawing is already stored. Tell the panel that reading
-      // stopped, and leave the picture itself alone.
-      const char *miss = "Reading did not finish. The drawing is still saved.";
-      copyField(job.text, sizeof(job.text), miss);
-      job.textSize = strlen(job.text);
-      job.textReady = true;
-    }
-  }
-
-  if (!sendOcrResultToPanel(job)) {
-    Serial.printf("OCR text for drawing %08lX is waiting for BLE return.\n",
-                  (unsigned long)job.drawingId);
-    nextOcrAttemptMs = millis() + 5000;
-    return;
-  }
-  Serial.printf("OCR text for drawing %08lX was saved on the student panel.\n",
-                (unsigned long)job.drawingId);
-  ocrJobRead = (ocrJobRead + 1) % OCR_QUEUE_MAX;
-  nextOcrAttemptMs = 0;
-}
-
-static void drainDrawingPackets() {
-  if (drawingQueueOverflow) {
-    noInterrupts();
-    uint32_t overflowId = drawingOverflowId;
-    drawingOverflowId = 0;
-    drawingQueueOverflow = false;
-    interrupts();
-    if (overflowId != 0) {
-      sendDrawingResult(overflowId, false);
-    }
-  }
-  while (drawingRingRead != drawingRingWrite) {
-    DrawingPacketEntry packet = drawingRing[drawingRingRead];
-    drawingRingRead = (drawingRingRead + 1) % DRAWING_RING_MAX;
-    handleDrawingPacket(packet.bytes, packet.length);
-  }
-}
-
 static void notifyReply(ClearNote note, uint8_t answer) {
   note.kind = CLEAR_KIND_REPLY;
   note.answer = answer;
@@ -2350,6 +1624,7 @@ static void cycleStudent() {
 
 // Rotation 2 turns the picture right side up. The chip's raw point
 // then matches the pixel under the finger.
+// --- Touch ---
 static bool readCapTouch(int32_t *x, int32_t *y) {
   Wire.beginTransmission(TP_ADDR);
   Wire.write(0x00);
@@ -2427,7 +1702,6 @@ static void drainNotices() {
     reportStatus(note, CLEAR_ANSWER_GOT);
     paintScreen();
   }
-  drainDrawingPackets();
 }
 
 static void finishSignIn() {
@@ -2439,8 +1713,6 @@ static void finishSignIn() {
   }
   if (!servicesStarted) {
     startRadio();
-    startUsbDrive();
-    startOcrWifi();
     servicesStarted = true;
   }
   paintScreen();
@@ -2477,6 +1749,7 @@ void setup() {
   loadPrivacy();
   lcd.init();
   lcd.setRotation(2);
+  lcd.beginBuffer();
   applyBrightness();
   startStorage();
   ClearWebLink::begin(SPIFFS, LOG_PATH, "/", webCodesMatch);
@@ -2484,23 +1757,23 @@ void setup() {
   startTeacherClock();
   activityMs = millis();
   paintScreen();
+  lcd.present();
   ClearWebLink::poll();
 }
 
 void loop() {
+  lcd.present();
   ClearWebLink::poll();
   serviceBlank();
   serviceBuzz();
   if (screenBlank) {
     if (servicesStarted) {
       drainNotices();
-      serviceOcrJobs();
     }
     return;
   }
   if (servicesStarted) {
       drainNotices();
-      serviceOcrJobs();
       serviceStudentSettings();
       serviceNetworkClock();
     if ((long)(millis() - clockSaveMs) >= 60000) {
